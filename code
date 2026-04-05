@@ -1,0 +1,1284 @@
+import re
+import os
+import sys
+import csv
+import hashlib
+import pandas as pd
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QLabel, QPushButton, QGridLayout, QWidget,
+    QMessageBox, QLineEdit, QVBoxLayout, QTableWidget, QTableWidgetItem,
+    QScrollArea
+)
+from PyQt5.QtGui import QPixmap, QFont
+from PyQt5.QtCore import Qt
+import matplotlib.pyplot as plt
+import requests
+from datetime import datetime
+
+# -------------------- Configuration --------------------
+USERS_CSV = "users.csv"
+NEWS_API_KEY = '997364e606194ff2abad117c7eb975d4'  # keep your existing key or replace
+ALPHAVANTAGE_KEY = 'PKHNHME2W8N75FPL'  # replace with your key
+
+# -------------------- Helper functions --------------------
+def hash_password(password: str) -> str:
+    """Return SHA-256 hex digest of the password."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def migrate_legacy_file():
+    """
+    If users.csv exists and uses a 'Password' column (plain text),
+    convert it to 'PasswordHash' and rewrite file with hashed passwords.
+    """
+    if not os.path.isfile(USERS_CSV):
+        return
+
+    # Read file and detect headers
+    try:
+        with open(USERS_CSV, newline='', mode='r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
+    except Exception:
+        return
+
+    # If already using PasswordHash, nothing to do
+    if "PasswordHash" in fieldnames:
+        return
+
+    # If old 'Password' column present, convert
+    if "Password" in fieldnames:
+        new_rows = []
+        for r in rows:
+            pwd = r.get("Password", "").strip()
+            pwd_hash = hash_password(pwd) if pwd else ""
+            new_rows.append({
+                "Email": r.get("Email", "").strip(),
+                "PasswordHash": pwd_hash,
+                "Name": r.get("Name", "").strip(),
+                "Mobile": r.get("Mobile", "").strip()
+            })
+        # Rewrite file with new header
+        with open(USERS_CSV, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['Email', 'PasswordHash', 'Name', 'Mobile'])
+            writer.writeheader()
+            for nr in new_rows:
+                writer.writerow(nr)
+
+def load_users():
+    """
+    Load users; supports both legacy (Password) and new (PasswordHash) formats.
+    Returns list of dicts with Email, PasswordHash, Name, Mobile
+    """
+    migrate_legacy_file()
+
+    users = []
+    if not os.path.isfile(USERS_CSV):
+        return users
+    try:
+        with open(USERS_CSV, newline='', mode='r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                users.append({
+                    "Email": row.get("Email", "").strip(),
+                    "PasswordHash": row.get("PasswordHash", "").strip(),
+                    "Name": row.get("Name", "").strip(),
+                    "Mobile": row.get("Mobile", "").strip()
+                })
+    except Exception:
+        return []
+    return users
+
+def save_user_record(email, password_hash, name, mobile):
+    file_exists = os.path.isfile(USERS_CSV)
+    with open(USERS_CSV, mode='a', newline='', encoding='utf-8') as file:
+        fieldnames = ['Email', 'PasswordHash', 'Name', 'Mobile']
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            'Email': email,
+            'PasswordHash': password_hash,
+            'Name': name,
+            'Mobile': mobile
+        })
+
+# -------------------- UI Windows --------------------
+class LoginWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Investify Login")
+        self.setGeometry(300, 300, 1200, 650)
+
+        # Background label
+        self.background = QLabel(self)
+        bg_path = "light_blue_background.png"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+
+        self.initUI()
+
+    def initUI(self):
+        # Welcome Label
+        self.label = QLabel("Welcome to Investify", self)
+        self.label.setFont(QFont("Arial", 40, QFont.Bold))
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setStyleSheet("color: black;")
+
+        # User ID (email or name)
+        self.user_id_label = QLabel("EMAIL or NAME:", self)
+        self.user_id_label.setFont(QFont("Arial", 22))
+        self.user_id_label.setStyleSheet("color: black;")
+        self.user_id_input = QLineEdit(self)
+        self.user_id_input.setFont(QFont("Arial", 18))
+        self.user_id_input.setStyleSheet(self.get_line_edit_style())
+
+        # Password
+        self.password_label = QLabel("PASSWORD:", self)
+        self.password_label.setFont(QFont("Arial", 22))
+        self.password_label.setStyleSheet("color: black;")
+        self.password_input = QLineEdit(self)
+        self.password_input.setFont(QFont("Arial", 18))
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setStyleSheet(self.get_line_edit_style())
+
+        # Login Button
+        self.login_button = QPushButton("Login", self)
+        self.login_button.clicked.connect(self.check_login)
+        self.login_button.setStyleSheet(self.get_button_style())
+
+        # Sign Up Button
+        self.signup_button = QPushButton("Create Account", self)
+        self.signup_button.clicked.connect(self.show_signup)
+        self.signup_button.setStyleSheet(self.get_button_style())
+
+        # Position widgets
+        self.update_ui_positions()
+
+    def resizeEvent(self, event):
+        bg_path = "light_blue_background.png"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+        self.update_ui_positions()
+        super().resizeEvent(event)
+
+    def update_ui_positions(self):
+        window_width = self.width()
+        window_height = self.height()
+
+        # Welcome Label
+        self.label.setGeometry(window_width // 4, window_height // 10, window_width // 2, 60)
+
+        # User ID
+        self.user_id_label.setGeometry(window_width // 3 - 50, window_height // 3, 300, 40)
+        self.user_id_input.setGeometry(window_width // 2 - 50, window_height // 3, 300, 40)
+
+        # Password
+        self.password_label.setGeometry(window_width // 3 - 50, window_height // 3 + 100, 300, 40)
+        self.password_input.setGeometry(window_width // 2 - 50, window_height // 3 + 100, 300, 40)
+
+        # Sign Up Button
+        self.signup_button.setGeometry(window_width // 2 - 150, window_height * 2 // 3, 300, 40)
+
+        # Login Button
+        self.login_button.setGeometry(window_width // 2 - 150, window_height * 3 // 4, 300, 40)
+
+    def check_login(self):
+        user_id = self.user_id_input.text().strip()
+        password = self.password_input.text()
+
+        if not user_id or not password:
+            QMessageBox.warning(self, "Input Error", "Please provide Email/Name and Password.")
+            return
+
+        users = load_users()
+        if not users:
+            QMessageBox.warning(self, "No Accounts", "No accounts found. Please create an account first.")
+            return
+
+        password_hash = hash_password(password)
+
+        # Try match by email (case-insensitive) or by name
+        matched_user = None
+        for u in users:
+            if user_id.lower() == u["Email"].lower() or user_id.lower() == u["Name"].lower():
+                if password_hash == u["PasswordHash"]:
+                    matched_user = u
+                    break
+                else:
+                    QMessageBox.warning(self, "Login Failed", "Invalid password.")
+                    return
+
+        if matched_user:
+            QMessageBox.information(self, "Login Success", f"Welcome back, {matched_user['Name']}!")
+            self.show_dashboard(matched_user)
+        else:
+            QMessageBox.warning(self, "Login Failed", "User not found. Please sign up.")
+
+    def show_dashboard(self, user):
+        self.dashboard_window = DashboardWindow(user)
+        self.dashboard_window.show()
+        self.close()
+
+    def show_signup(self):
+        self.signup_window = SignUpWindow()
+        self.signup_window.show()
+        self.close()
+
+    def get_button_style(self):
+        return (
+            "QPushButton {"
+            "background-color: lightblue; border-radius: 10px; font-weight: bold; color: black; padding: 5px;"
+            "}"
+            "QPushButton:hover {"
+            "background-color: darkblue; color: white;"
+            "}"
+        )
+
+    def get_line_edit_style(self):
+        return (
+            "QLineEdit {"
+            "background-color: rgba(0, 0, 0, 0);"
+            "border: none;"
+            "border-bottom: 2px solid rgba(46, 82, 101, 200);"
+            "color: rgba(0, 0, 0, 240);"
+            "padding-bottom: 7px;"
+            "}"
+        )
+
+class SignUpWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Investify Sign-Up")
+        self.setGeometry(300, 300, 1200, 650)
+
+        # Background
+        self.background = QLabel(self)
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+
+        self.initUI()
+
+    def initUI(self):
+        # Sign-Up Label
+        self.label = QLabel("Create an Account", self)
+        self.label.setFont(QFont("Arial", 30, QFont.Bold))
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setStyleSheet("color: white;")
+
+        # Name
+        self.name_label = QLabel("Name:", self)
+        self.name_label.setFont(QFont("Arial", 22))
+        self.name_label.setStyleSheet("color: white;")
+        self.name_input = QLineEdit(self)
+        self.name_input.setFont(QFont("Arial", 18))
+        self.name_input.setStyleSheet(self.get_line_edit_style())
+
+        # Mobile Number
+        self.mobile_label = QLabel("PhoneNumber:", self)
+        self.mobile_label.setFont(QFont("Arial", 22))
+        self.mobile_label.setStyleSheet("color: white;")
+        self.mobile_input = QLineEdit(self)
+        self.mobile_input.setFont(QFont("Arial", 18))
+        self.mobile_input.setStyleSheet(self.get_line_edit_style())
+
+        # Email ID
+        self.email_label = QLabel("Email ID:", self)
+        self.email_label.setFont(QFont("Arial", 22))
+        self.email_label.setStyleSheet("color: white;")
+        self.email_input = QLineEdit(self)
+        self.email_input.setFont(QFont("Arial", 18))
+        self.email_input.setStyleSheet(self.get_line_edit_style())
+
+        # Password
+        self.password_label = QLabel("Password:", self)
+        self.password_label.setFont(QFont("Arial", 22))
+        self.password_label.setStyleSheet("color: white;")
+        self.password_input = QLineEdit(self)
+        self.password_input.setFont(QFont("Arial", 18))
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setStyleSheet(self.get_line_edit_style())
+
+        # Sign-Up Button
+        self.signup_button = QPushButton("Sign Up", self)
+        self.signup_button.setFont(QFont("Arial", 20))
+        self.signup_button.setStyleSheet(self.get_button_style())
+        self.signup_button.clicked.connect(self.save_user)
+
+        # Position widgets
+        self.update_ui_positions()
+
+    def resizeEvent(self, event):
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+        self.update_ui_positions()
+        super().resizeEvent(event)
+
+    def update_ui_positions(self):
+        window_width = self.width()
+        window_height = self.height()
+
+        # Sign-Up Label
+        self.label.setGeometry(window_width // 4, window_height // 10, window_width // 2, 50)
+
+        # Name
+        self.name_label.setGeometry(window_width // 6, window_height // 4, 200, 40)
+        self.name_input.setGeometry(window_width // 2 - 50, window_height // 4, 300, 40)
+
+        # Mobile Number
+        self.mobile_label.setGeometry(window_width // 6, window_height // 4 + 100, 200, 40)
+        self.mobile_input.setGeometry(window_width // 2 - 50, window_height // 4 + 100, 300, 40)
+
+        # Email ID
+        self.email_label.setGeometry(window_width // 6, window_height // 4 + 200, 200, 40)
+        self.email_input.setGeometry(window_width // 2 - 50, window_height // 4 + 200, 300, 40)
+
+        # Password
+        self.password_label.setGeometry(window_width // 6, window_height // 4 + 300, 200, 40)
+        self.password_input.setGeometry(window_width // 2 - 50, window_height // 4 + 300, 300, 40)
+
+        # Sign-Up Button
+        self.signup_button.setGeometry(window_width // 2 - 75, window_height * 3 // 4 + 20, 150, 60)
+
+    def get_line_edit_style(self):
+        return (
+            "QLineEdit {"
+            "background-color: rgba(0, 0, 0, 0);"
+            "border: none;"
+            "border-bottom: 2px solid rgba(46, 82, 101, 200);"
+            "color: rgba(0, 0, 0, 240);"
+            "padding-bottom: 7px;"
+            "}"
+        )
+
+    def save_user(self):
+        name = self.name_input.text().strip()
+        mobile = self.mobile_input.text().strip()
+        email = self.email_input.text().strip().lower()
+        password = self.password_input.text()
+
+        # Basic validation
+        if not name or not mobile or not email or not password:
+            QMessageBox.warning(self, "Input Error", "Please fill in all fields.")
+            return
+
+        # Validate email
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            QMessageBox.warning(self, "Invalid Email", "Please enter a valid email address.")
+            return
+
+        users = load_users()
+        # Check duplicate email
+        for u in users:
+            if u["Email"].lower() == email:
+                QMessageBox.warning(self, "Duplicate Email", "An account with this email already exists. Please login or use another email.")
+                return
+
+        password_hash = hash_password(password)
+        save_user_record(email, password_hash, name, mobile)
+
+        QMessageBox.information(self, "Sign-Up Success", "Account created successfully! Please login.")
+        self.show_login()
+
+    def show_login(self):
+        self.login_window = LoginWindow()
+        self.login_window.show()
+        self.close()
+
+    def get_button_style(self):
+        return (
+            "QPushButton {"
+            "background-color: lightblue; border-radius: 10px; font-weight: bold; color: black; padding: 5px;"
+            "}"
+            "QPushButton:hover {"
+            "background-color: darkblue; color: white;"
+            "}"
+        )
+
+class DashboardWindow(QMainWindow):
+    def __init__(self, user=None):
+        super().__init__()
+        self.setWindowTitle("Investify Dashboard")
+        self.setGeometry(300, 300, 1200, 650)
+
+        # user is the logged-in user's dict (may be None)
+        self.user = user
+
+        # Background
+        self.background = QLabel(self)
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+
+        self.initUI()
+
+    def initUI(self):
+        # Title Label (personalize if user available)
+        greeting = f"Welcome, {self.user['Name']}" if self.user else "Investify"
+        self.title_label = QLabel(greeting, self)
+        self.title_label.setFont(QFont("Arial", 30, QFont.Bold))
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setStyleSheet("color: #39ff14;")  # Neon green
+
+        # Live Stock Button
+        self.live_stock_button = QPushButton(" Stock Portfolio", self)
+        self.live_stock_button.clicked.connect(self.show_live_stock)
+        self.live_stock_button.setStyleSheet(self.get_button_style())
+
+        # Personal Finance Button
+        self.personal_finance_button = QPushButton("Personal Finance", self)
+        self.personal_finance_button.clicked.connect(self.show_personal_finance)
+        self.personal_finance_button.setStyleSheet(self.get_button_style())
+
+        # Invest Button
+        self.invest_button = QPushButton("Invest", self)
+        self.invest_button.clicked.connect(self.show_invest)
+        self.invest_button.setStyleSheet(self.get_button_style())
+
+        # Profile Button (News)
+        self.profile_button = QPushButton("Finance News", self)
+        self.profile_button.clicked.connect(self.show_news)
+        self.profile_button.setStyleSheet(self.get_button_style())
+
+        # Position items
+        self.update_ui_positions()
+
+    def resizeEvent(self, event):
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+        self.update_ui_positions()
+        super().resizeEvent(event)
+
+    def update_ui_positions(self):
+        window_width = self.width()
+        window_height = self.height()
+
+        # Title Label
+        self.title_label.setGeometry(window_width // 4, window_height // 10, window_width // 2, 60)
+
+        # Live Stock Button
+        self.live_stock_button.setGeometry(window_width // 6, window_height // 4, 240, 100)
+
+        # Personal Finance Button
+        self.personal_finance_button.setGeometry(window_width * 2 // 3, window_height // 4, 240, 100)
+
+        # Invest Button
+        self.invest_button.setGeometry(window_width // 6, window_height // 2, 240, 100)
+
+        # Profile Button
+        self.profile_button.setGeometry(window_width * 2 // 3, window_height // 2, 240, 100)
+
+    def show_live_stock(self):
+        self.live_stock_window = LiveStockWindow()
+        self.live_stock_window.show()
+
+    def show_personal_finance(self):
+        self.personal_finance_window = PersonalFinanceWindow()
+        self.personal_finance_window.show()
+
+    def show_invest(self):
+        self.invest_window = InvestWindow()
+        self.invest_window.show()
+
+    def show_news(self):
+        self.news_window = NewsWindow()
+        self.news_window.show()
+
+    def get_button_style(self):
+        return (
+            "QPushButton {"
+            "background-color: lightblue; border-radius: 10px; font-weight: bold; color: black; padding: 5px;"
+            "}"
+            "QPushButton:hover {"
+            "background-color: darkblue; color: white;"
+            "}"
+        )
+
+class NewsWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Indian Stock Market News")
+        self.setGeometry(300, 300, 600, 400)
+        self.initUI()
+        self.display_financial_news()
+
+    def initUI(self):
+        self.central_widget = QWidget(self)
+        self.setCentralWidget(self.central_widget)
+        self.layout = QVBoxLayout(self.central_widget)
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setWidgetResizable(True)
+        self.news_container = QWidget()
+        self.news_layout = QVBoxLayout(self.news_container)
+        self.scroll_area.setWidget(self.news_container)
+        self.layout.addWidget(self.scroll_area)
+
+    def get_financial_news(self):
+        API_KEY = NEWS_API_KEY
+        url = f'https://newsapi.org/v2/everything?q=indian%20stock%20market&language=en&sortBy=publishedAt&apiKey={API_KEY}'
+        try:
+            response = requests.get(url, timeout=8)
+            if response.status_code == 200:
+                data = response.json()
+                if 'articles' in data:
+                    return data['articles']
+        except Exception:
+            pass
+        return []
+
+    def display_financial_news(self):
+        news_items = self.get_financial_news()
+        if news_items:
+            for item in news_items[:5]:
+                news_widget = QWidget(self.news_container)
+                news_layout = QVBoxLayout(news_widget)
+                headline_label = QLabel(f"<b>{item.get('title','No title')}</b>", self)
+                headline_label.setFont(QFont("Arial", 16))
+                headline_label.setStyleSheet("color: #0056b3;")
+                news_layout.addWidget(headline_label)
+                snippet_label = QLabel(item.get('description', 'No summary available.'), self)
+                snippet_label.setWordWrap(True)
+                news_layout.addWidget(snippet_label)
+                pub_time = item.get('publishedAt', 'Unknown')
+                pub_time_label = QLabel(f"Published at: {self.format_time(pub_time)}", self)
+                pub_time_label.setStyleSheet("font-size: 12px; color: #777777;")
+                news_layout.addWidget(pub_time_label)
+                self.news_layout.addWidget(news_widget)
+                self.news_layout.addWidget(QLabel("<hr>"))
+        else:
+            no_news_label = QLabel("No financial news available at the moment.", self)
+            no_news_label.setAlignment(Qt.AlignCenter)
+            self.news_layout.addWidget(no_news_label)
+
+    def format_time(self, pub_time):
+        try:
+            pub_time = datetime.strptime(pub_time, "%Y-%m-%dT%H:%M:%SZ")
+            return pub_time.strftime("%b %d, %Y %H:%M")
+        except Exception:
+            return "Unknown Time"
+
+class PersonalFinanceWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Personal Finance")
+        self.setGeometry(300, 300, 1200, 650)
+
+        # Background
+        self.background = QLabel(self)
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+
+        self.expenses = []
+        self.initUI()
+
+    def initUI(self):
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+        central_layout = QVBoxLayout(central_widget)
+
+        # Income
+        self.income_label = QLabel("Enter Your Monthly Income:")
+        self.income_label.setStyleSheet("color: black;")
+        self.income_label.setFont(QFont("Arial", 22))
+
+        self.income_input = QLineEdit(self)
+        self.income_input.setStyleSheet(self.get_line_edit_style())
+        self.income_input.setFont(QFont("Arial", 18))
+        self.income_input.setFixedSize(400, 40)
+
+        # Expense
+        self.expense_label = QLabel("Enter Expense Description and Amount:")
+        self.expense_label.setStyleSheet("color: black;")
+        self.expense_label.setFont(QFont("Arial", 22))
+
+        self.expense_desc_input = QLineEdit(self)
+        self.expense_desc_input.setPlaceholderText("Expense Description")
+        self.expense_desc_input.setStyleSheet(self.get_line_edit_style())
+        self.expense_desc_input.setFixedSize(400, 40)
+
+        self.expense_amount_input = QLineEdit(self)
+        self.expense_amount_input.setPlaceholderText("Expense Amount")
+        self.expense_amount_input.setStyleSheet(self.get_line_edit_style())
+        self.expense_amount_input.setFixedSize(400, 40)
+
+        # Buttons
+        self.add_expense_button = QPushButton("Add Expense", self)
+        self.add_expense_button.setFixedSize(300, 40)
+        self.add_expense_button.clicked.connect(self.add_expense)
+        self.add_expense_button.setStyleSheet(self.get_button_style())
+
+        self.plot_button = QPushButton("Plot Pie Chart", self)
+        self.plot_button.setFixedSize(300, 40)
+        self.plot_button.clicked.connect(self.plot_pie_chart)
+        self.plot_button.setStyleSheet(self.get_button_style())
+
+        central_layout.addWidget(self.income_label, alignment=Qt.AlignCenter)
+        central_layout.addWidget(self.income_input, alignment=Qt.AlignCenter)
+        central_layout.addWidget(self.expense_label, alignment=Qt.AlignCenter)
+        central_layout.addWidget(self.expense_desc_input, alignment=Qt.AlignCenter)
+        central_layout.addWidget(self.expense_amount_input, alignment=Qt.AlignCenter)
+        central_layout.addWidget(self.add_expense_button, alignment=Qt.AlignCenter)
+        central_layout.addWidget(self.plot_button, alignment=Qt.AlignCenter)
+
+        central_layout.setSpacing(20)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_widget.setStyleSheet("background: transparent;")
+
+    def resizeEvent(self, event):
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+        super().resizeEvent(event)
+
+    def add_expense(self):
+        try:
+            expense_desc = self.expense_desc_input.text().strip()
+            expense_amount = float(self.expense_amount_input.text())
+
+            if not expense_desc or expense_amount <= 0:
+                raise ValueError("Invalid input")
+
+            self.expenses.append((expense_desc, expense_amount))
+            QMessageBox.information(self, "Success", "Expense added successfully!")
+
+            self.expense_desc_input.clear()
+            self.expense_amount_input.clear()
+
+        except Exception:
+            QMessageBox.warning(self, "Input Error", "Please enter a valid expense description and amount.")
+
+    def plot_pie_chart(self):
+        try:
+            income = float(self.income_input.text())
+
+            if not self.expenses:
+                raise ValueError("No expenses added")
+
+            total_expenses = sum(amount for _, amount in self.expenses)
+
+            if total_expenses > income:
+                QMessageBox.warning(self, "Budget Error", "Your total expenses exceed your income!")
+                return
+
+            # Add remaining income as a category
+            expenses_copy = list(self.expenses)
+            expenses_copy.append(("Remaining Income", income - total_expenses))
+
+            labels = [desc for desc, _ in expenses_copy]
+            values = [amount for _, amount in expenses_copy]
+            colors = plt.cm.Paired.colors[:len(labels)]
+
+            plt.figure(figsize=(7, 5))
+            plt.pie(values, labels=labels, colors=colors, autopct='%1.1f%%', startangle=140)
+            plt.title("Income vs Expenses Breakdown")
+            plt.show()
+
+            # Store data in CSV file (entire list)
+            with open("personal_finance.csv", "w", newline="", encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow(["Income", income])
+                writer.writerow(["Description", "Amount"])
+                for desc, amount in expenses_copy:
+                    writer.writerow([desc, amount])
+
+            QMessageBox.information(self, "Success", "Data has been saved to personal_finance.csv")
+
+        except Exception:
+            QMessageBox.warning(self, "Input Error", "Please enter a valid income and add at least one expense.")
+
+    def get_button_style(self):
+        return (
+            "QPushButton {"
+            "background-color: lightblue; border-radius: 10px; font-weight: bold; color: black; padding: 5px;"
+            "} "
+            "QPushButton:hover {"
+            "background-color: darkblue; color: white;"
+            "}"
+        )
+
+    def get_line_edit_style(self):
+        return (
+            "QLineEdit {"
+            "background-color: rgba(0, 0, 0, 0);"
+            "border: none;"
+            "border-bottom: 2px solid rgba(46, 82, 101, 200);"
+            "color: rgba(0, 0, 0, 240);"
+            "padding-bottom: 7px;"
+            "}"
+        )
+
+class LiveStockWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Investify Stock Portfolio")
+        self.setGeometry(300, 300, 1200, 600)
+
+        self.stocks = []  # List to hold stock symbol and quantity
+        self.initUI()
+
+    def initUI(self):
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+
+        # Background gradient via stylesheet
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: qlineargradient(
+                    spread: pad, x1:0, y1:0, x2:1, y2:1,
+                    stop: 0 #00416A, stop: 1 #E4E5E6);
+            }
+        """)
+
+        self.layout = QVBoxLayout(self.central_widget)
+
+        self.title_label = QLabel("Investify Stock Portfolio", self)
+        self.title_label.setFont(QFont("Arial", 30, QFont.Bold))
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.title_label)
+
+        self.summary_label = QLabel("Portfolio Summary", self)
+        self.summary_label.setFont(QFont("Arial", 20))
+        self.layout.addWidget(self.summary_label)
+
+        self.total_value_label = QLabel("Total Portfolio Value: ₹0", self)
+        self.layout.addWidget(self.total_value_label)
+
+        # Table to show stock holdings
+        self.stock_table = QTableWidget(0, 5)
+        self.stock_table.setHorizontalHeaderLabels(["Stock Symbol", "Quantity", "Current Price (₹)", "Value (₹)", "Profit/Loss"])
+        self.layout.addWidget(self.stock_table)
+
+        # Add/Remove Stocks
+        self.add_stock_label = QLabel("Add/Remove Stocks", self)
+        self.add_stock_label.setFont(QFont("Arial", 20))
+        self.layout.addWidget(self.add_stock_label)
+
+        self.stock_input = QLineEdit(self)
+        self.stock_input.setPlaceholderText("Enter Stock Symbol (e.g., TSLA)")
+        self.layout.addWidget(self.stock_input)
+
+        self.quantity_input = QLineEdit(self)
+        self.quantity_input.setPlaceholderText("Enter Quantity")
+        self.layout.addWidget(self.quantity_input)
+
+        self.add_button = QPushButton("Add Stock", self)
+        self.add_button.setStyleSheet(self.get_button_style())
+        self.add_button.clicked.connect(self.add_stock)
+        self.layout.addWidget(self.add_button)
+
+        self.remove_button = QPushButton("Remove Stock", self)
+        self.remove_button.setStyleSheet(self.get_button_style())
+        self.remove_button.clicked.connect(self.remove_stock)
+        self.layout.addWidget(self.remove_button)
+
+        self.graph_label = QLabel("Stock Performance Graph", self)
+        self.graph_label.setFont(QFont("Arial", 20))
+        self.layout.addWidget(self.graph_label)
+
+        self.view_graph_button = QPushButton("View Detailed Graph", self)
+        self.view_graph_button.setStyleSheet(self.get_button_style())
+        self.view_graph_button.clicked.connect(self.show_stock_graph_input)
+        self.layout.addWidget(self.view_graph_button)
+
+    def get_button_style(self):
+        return ("""
+            QPushButton {
+                background-color: #5BC0EB;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 15px;
+                border-radius: 10px;
+                border: 2px solid #005B96;
+            }
+            QPushButton:hover {
+                background-color: #0077CC;
+                border: 2px solid #003E7E;
+            }
+            QPushButton:pressed {
+                background-color: #005B96;
+                border: 2px solid #001F3F;
+            }
+        """)
+
+    def add_stock(self):
+        stock_symbol = self.stock_input.text().strip().upper()
+        quantity = self.quantity_input.text().strip()
+
+        if not stock_symbol or not quantity.isdigit():
+            QMessageBox.warning(self, "Input Error", "Please enter a valid stock symbol and quantity.")
+            return
+
+        quantity = int(quantity)
+
+        stock_price = self.get_stock_price(stock_symbol)
+        if stock_price is None:
+            QMessageBox.warning(self, "Error", "Failed to fetch stock price.")
+            return
+
+        stock_price *= 100  # Multiply the stock price by 100 (as in original code)
+
+        self.stocks.append({"symbol": stock_symbol, "quantity": quantity, "price": stock_price, "purchase_price": stock_price})
+        self.update_portfolio()
+
+    def remove_stock(self):
+        stock_symbol = self.stock_input.text().strip().upper()
+        self.stocks = [stock for stock in self.stocks if stock["symbol"] != stock_symbol]
+        self.update_portfolio()
+
+    def update_portfolio(self):
+        self.stock_table.setRowCount(0)
+
+        total_value = 0
+        for stock in self.stocks:
+            quantity = stock["quantity"]
+            stock_symbol = stock["symbol"]
+            purchase_price = stock["purchase_price"]
+            current_price = self.get_stock_price(stock_symbol)
+            current_price = (current_price * 100) if current_price is not None else 0
+            value = current_price * quantity if current_price is not None else 0
+
+            row_position = self.stock_table.rowCount()
+            self.stock_table.insertRow(row_position)
+            self.stock_table.setItem(row_position, 0, QTableWidgetItem(stock_symbol))
+            self.stock_table.setItem(row_position, 1, QTableWidgetItem(str(quantity)))
+            self.stock_table.setItem(row_position, 2, QTableWidgetItem(f"₹{current_price}" if current_price else "N/A"))
+            self.stock_table.setItem(row_position, 3, QTableWidgetItem(f"₹{value}" if value else "N/A"))
+
+            # Profit/Loss arrow (local path used in original)
+            profit_loss = current_price - purchase_price
+            arrow_label = QLabel(self)
+            # Try to use generic arrow icons if available, otherwise show text
+            up_path = "up.jpeg"
+            down_path = "down.jpeg"
+            if profit_loss >= 0 and os.path.isfile(up_path):
+                arrow_label.setPixmap(QPixmap(up_path).scaled(20, 20))
+            elif profit_loss < 0 and os.path.isfile(down_path):
+                arrow_label.setPixmap(QPixmap(down_path).scaled(20, 20))
+            else:
+                arrow_label.setText("▲" if profit_loss >= 0 else "▼")
+
+            self.stock_table.setCellWidget(row_position, 4, arrow_label)
+            total_value += value
+
+        self.total_value_label.setText(f"Total Portfolio Value: ₹{total_value}")
+
+    def get_stock_price(self, symbol):
+        API_KEY = ALPHAVANTAGE_KEY
+        url = f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={API_KEY}'
+        try:
+            response = requests.get(url, timeout=8)
+            data = response.json()
+            return float(data['Global Quote']['05. price'])
+        except Exception:
+            return None
+
+    def show_stock_graph_input(self):
+        self.stock_graph_window = StockGraphWindow()
+        self.stock_graph_window.show()
+
+class StockGraphWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Stock Performance Graph")
+        self.setGeometry(400, 200, 1200, 650)
+
+        self.layout = QVBoxLayout()
+
+        self.label = QLabel("Enter Stock Symbol for Graph:", self)
+        self.layout.addWidget(self.label)
+
+        self.stock_input = QLineEdit(self)
+        self.layout.addWidget(self.stock_input)
+
+        self.graph_button = QPushButton("View Graph", self)
+        self.graph_button.clicked.connect(self.show_stock_graph)
+        self.layout.addWidget(self.graph_button)
+
+        self.setLayout(self.layout)
+
+    def show_stock_graph(self):
+        stock_symbol = self.stock_input.text().strip().upper()
+        if stock_symbol:
+            stock_data = self.get_stock_data(stock_symbol)
+            if stock_data is not None:
+                self.plot_stock_data(stock_symbol, stock_data)
+            else:
+                QMessageBox.warning(self, "Error", "Failed to fetch stock data.")
+        else:
+            QMessageBox.warning(self, "Input Error", "Please enter a valid stock symbol.")
+
+    def get_stock_data(self, symbol):
+        API_KEY = ALPHAVANTAGE_KEY
+        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={API_KEY}'
+        try:
+            response = requests.get(url, timeout=8)
+            data = response.json()
+            time_series = data.get('Time Series (Daily)', {})
+            dates = list(time_series.keys())[:10]
+            prices = [float(time_series[date]['4. close']) * 100 for date in dates]
+            return dates, prices
+        except Exception:
+            return None
+
+    def plot_stock_data(self, symbol, stock_data):
+        dates, prices = stock_data
+        plt.figure(figsize=(10, 5))
+        plt.plot(dates, prices, marker='o')
+        plt.title(f"{symbol} Stock Prices Over the Last 10 Days ")
+        plt.xlabel("Date")
+        plt.ylabel("Price (₹)")
+        plt.xticks(rotation=45)
+        plt.grid()
+        plt.tight_layout()
+        plt.show()
+
+class InvestWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Invest")
+        self.setGeometry(300, 300, 1200, 650)
+
+        # Background
+        self.background = QLabel(self)
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+
+        self.initUI()
+
+    def initUI(self):
+        self.title_label = QLabel("Investify", self)
+        self.title_label.setFont(QFont("Arial", 30, QFont.Bold))
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setStyleSheet("color: #39FF14;")
+
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+
+        self.grid_layout = QGridLayout(central_widget)
+        central_widget.setStyleSheet("background: transparent;")
+
+        self.fd_button = QPushButton("FD", self)
+        self.fd_button.setStyleSheet(self.get_button_style())
+        self.fd_button.clicked.connect(self.handle_fd_button)
+
+        self.gold_bond_button = QPushButton("GOLD BOND", self)
+        self.gold_bond_button.setStyleSheet(self.get_button_style())
+        self.gold_bond_button.clicked.connect(self.handle_gold_bond_button)
+
+        self.stock_button = QPushButton("STOCK", self)
+        self.stock_button.setStyleSheet(self.get_button_style())
+        self.stock_button.clicked.connect(self.handle_stock_button)
+
+        self.grid_layout.addWidget(self.fd_button, 0, 0)
+        self.grid_layout.addWidget(self.gold_bond_button, 0, 1)
+        self.grid_layout.addWidget(self.stock_button, 1, 0, 1, 2)
+
+        self.update_ui_positions()
+
+    def resizeEvent(self, event):
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, self.width(), self.height())
+        self.update_ui_positions()
+        super().resizeEvent(event)
+
+    def update_ui_positions(self):
+        window_width = self.width()
+        window_height = self.height()
+        self.title_label.setGeometry(window_width // 4, window_height // 10, window_width // 2, 60)
+        self.grid_layout.setColumnStretch(0, 1)
+        self.grid_layout.setColumnStretch(1, 1)
+        button_height = window_height // 8
+        self.fd_button.setMinimumHeight(button_height)
+        self.gold_bond_button.setMinimumHeight(button_height)
+        self.stock_button.setMinimumHeight(button_height)
+
+    def handle_fd_button(self):
+        self.fd_window = FDWindow()
+        self.fd_window.show()
+
+    def handle_gold_bond_button(self):
+        self.gold_bond_window = GoldBondWindow()
+        self.gold_bond_window.show()
+
+    def handle_stock_button(self):
+        self.stock_window = StockWindow()
+        self.stock_window.show()
+
+    def get_button_style(self):
+        return (
+            "QPushButton {"
+            "background-color: lightblue; border-radius: 10px; font-weight: bold; color: black; padding: 5px; width: 150px; height: 50px;"
+            "} "
+            "QPushButton:hover {"
+            "background-color: darkblue; color: white;"
+            "}"
+        )
+
+class FDWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Fixed Deposit")
+        self.setGeometry(300, 300, 1200, 650)
+
+        self.background = QLabel(self)
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, 1200, 650)
+
+        self.initUI()
+
+    def initUI(self):
+        self.title_label = QLabel("Fixed Deposit", self)
+        self.title_label.setFont(QFont("Arial", 30, QFont.Bold))
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setGeometry(370, 50, 600, 60)
+        self.title_label.setStyleSheet("color: #39FF14;")
+
+        self.amount_label = QLabel("Enter Amount to Deposit (₹):", self)
+        self.amount_label.setGeometry(450, 150, 400, 30)
+        self.amount_label.setStyleSheet("color: white;")
+        self.amount_label.setFont(QFont("Arial", 22))
+
+        self.amount_input = QLineEdit(self)
+        self.amount_input.setGeometry(450, 190, 400, 40)
+        self.amount_input.setStyleSheet(self.get_line_edit_style())
+
+        self.time_label = QLabel("Enter Time in Years:", self)
+        self.time_label.setGeometry(450, 250, 400, 30)
+        self.time_label.setStyleSheet("color: white;")
+        self.time_label.setFont(QFont("Arial", 22))
+
+        self.time_input = QLineEdit(self)
+        self.time_input.setGeometry(450, 290, 400, 40)
+        self.time_input.setStyleSheet(self.get_line_edit_style())
+
+        self.submit_button = QPushButton("Open FD", self)
+        self.submit_button.setGeometry(500, 350, 300, 40)
+        self.submit_button.setStyleSheet(self.get_button_style())
+        self.submit_button.clicked.connect(self.open_fd)
+
+    def open_fd(self):
+        try:
+            amount = float(self.amount_input.text())
+            time_in_years = int(self.time_input.text())
+            if amount <= 0 or time_in_years < 1:
+                raise ValueError
+
+            P = amount
+            r = 0.08  # 8% interest
+            A = P * (1 + r) ** time_in_years
+            interest = A - P
+
+            with open('fd_data.csv', mode='a', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow([P, time_in_years, A, interest])
+
+            QMessageBox.information(self, "FD Opened", f"FD opened successfully!\nMaturity Amount: ₹{A:.2f}\nInterest Earned: ₹{interest:.2f}")
+            self.close()
+        except Exception:
+            QMessageBox.warning(self, "Input Error", "Please enter valid positive numbers.")
+
+    def get_line_edit_style(self):
+        return "QLineEdit {border: 2px solid black; border-radius: 5px; padding: 5px;}"
+
+    def get_button_style(self):
+        return (
+            "QPushButton {"
+            "background-color: lightblue; border-radius: 10px; font-weight: bold; color: black; padding: 5px;"
+            "} "
+            "QPushButton:hover {"
+            "background-color: darkblue; color: white;"
+            "}"
+        )
+
+class GoldBondWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Gold Bond")
+        self.setGeometry(300, 300, 1200, 650)
+
+        self.background = QLabel(self)
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, 1200, 650)
+
+        self.initUI()
+
+    def initUI(self):
+        self.title_label = QLabel("Gold Bond Investment", self)
+        self.title_label.setFont(QFont("Arial", 30, QFont.Bold))
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setGeometry(370, 50, 600, 60)
+        self.title_label.setStyleSheet("color: #39FF14;")
+
+        self.amount_label = QLabel("Enter Amount to Invest (₹):", self)
+        self.amount_label.setGeometry(450, 150, 400, 30)
+        self.amount_label.setStyleSheet("color: white;")
+        self.amount_label.setFont(QFont("Arial",22))
+
+        self.amount_input = QLineEdit(self)
+        self.amount_input.setGeometry(450, 190, 400, 40)
+        self.amount_input.setStyleSheet(self.get_line_edit_style())
+        self.amount_input.setFont(QFont("Arial",22))
+
+        self.duration_label = QLabel("Enter Duration in Years:", self)
+        self.duration_label.setGeometry(450, 250, 400, 30)
+        self.duration_label.setStyleSheet("color: white;")
+        self.duration_label.setFont(QFont("Arial",22))
+
+        self.duration_input = QLineEdit(self)
+        self.duration_input.setGeometry(450, 290, 400, 40)
+        self.duration_input.setStyleSheet(self.get_line_edit_style())
+        self.duration_input.setFont(QFont("Arial",22))
+
+        self.submit_button = QPushButton("Invest in Gold Bond", self)
+        self.submit_button.setGeometry(450, 350, 400, 80)
+        self.submit_button.setStyleSheet(self.get_button_style())
+        self.submit_button.clicked.connect(self.invest_gold_bond)
+
+    def invest_gold_bond(self):
+        try:
+            amount = float(self.amount_input.text())
+            duration = int(self.duration_input.text())
+
+            if amount <= 0 or duration < 1:
+                raise ValueError
+
+            r = 0.07
+            A = amount * (1 + r) ** duration
+            interest = A - amount
+
+            with open('gold_bond_data.csv', mode='a', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow([amount, duration, A, interest])
+
+            QMessageBox.information(self, "Gold Bond Invested",
+                                    f"Gold Bond investment successful!\nMaturity Amount: ₹{A:.2f}\nInterest Earned: ₹{interest:.2f}")
+            self.close()
+        except Exception:
+            QMessageBox.warning(self, "Input Error", "Please enter valid positive numbers.")
+
+    def get_line_edit_style(self):
+        return "QLineEdit {border: 2px solid black; border-radius: 5px; padding: 5px;}"
+
+    def get_button_style(self):
+        return (
+            "QPushButton {"
+            "background-color: lightblue; border-radius: 10px; font-weight: bold; color: black; padding: 5px;"
+            "} "
+            "QPushButton:hover {"
+            "background-color: darkblue; color: white;"
+            "}"
+        )
+
+class StockWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Stock Investment")
+        self.setGeometry(300, 300, 1200, 650)
+
+        self.background = QLabel(self)
+        bg_path = "blue.jpg"
+        if os.path.isfile(bg_path):
+            self.background.setPixmap(QPixmap(bg_path).scaled(self.width(), self.height()))
+        self.background.setGeometry(0, 0, 1200, 650)
+
+        self.initUI()
+
+    def initUI(self):
+        self.title_label = QLabel("Stock Investment", self)
+        self.title_label.setFont(QFont("Arial", 30, QFont.Bold))
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setGeometry(370, 50, 600, 60)
+        self.title_label.setStyleSheet("color: #39FF14;")
+
+        self.stock_name_label = QLabel("Enter Stock Name:", self)
+        self.stock_name_label.setGeometry(450, 150, 400, 30)
+        self.stock_name_label.setStyleSheet("color: white;")
+        self.stock_name_label.setFont(QFont("Arial",22))
+
+        self.stock_name_input = QLineEdit(self)
+        self.stock_name_input.setGeometry(450, 190, 400, 40)
+        self.stock_name_input.setStyleSheet(self.get_line_edit_style())
+        self.stock_name_input.setFont(QFont("Arial",22))
+
+        self.amount_label = QLabel("Enter Amount to Invest (₹):", self)
+        self.amount_label.setGeometry(450, 250, 400, 30)
+        self.amount_label.setStyleSheet("color: white;")
+        self.amount_label.setFont(QFont("Arial",22))
+
+        self.amount_input = QLineEdit(self)
+        self.amount_input.setGeometry(450, 290, 400, 40)
+        self.amount_input.setStyleSheet(self.get_line_edit_style())
+        self.amount_input.setFont(QFont("Arial",22))
+
+        self.submit_button = QPushButton("Invest in Stock", self)
+        self.submit_button.setGeometry(450, 350, 400, 80)
+        self.submit_button.setStyleSheet(self.get_button_style())
+        self.submit_button.clicked.connect(self.invest_stock)
+
+    def invest_stock(self):
+        try:
+            stock_name = self.stock_name_input.text().strip()
+            amount = float(self.amount_input.text())
+
+            if amount <= 0 or not stock_name:
+                raise ValueError
+            r = 0.10
+            A = amount * (1 + r)
+            interest = A - amount
+
+            with open('stock_data.csv', mode='a', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow([stock_name, amount, A, interest])
+
+            QMessageBox.information(self, "Stock Invested",
+                                    f"Stock investment successful!\nStock Name: {stock_name}\nMaturity Amount: ₹{A:.2f}\nInterest Earned: ₹{interest:.2f}")
+            self.close()
+        except Exception:
+            QMessageBox.warning(self, "Input Error", "Please enter valid values.")
+
+    def get_line_edit_style(self):
+        return "QLineEdit {border: 2px solid black; border-radius: 5px; padding: 5px;}"
+
+    def get_button_style(self):
+        return (
+            "QPushButton {"
+            "background-color: lightblue; border-radius: 10px; font-weight: bold; color: black; padding: 5px;"
+            "} "
+            "QPushButton:hover {"
+            "background-color: darkblue; color: white;"
+            "}"
+        )
+
+# -------------------- App Entry --------------------
+if __name__ == "__main__":
+    # Ensure users.csv exists with header when first run
+    if not os.path.isfile(USERS_CSV):
+        with open(USERS_CSV, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['Email', 'PasswordHash', 'Name', 'Mobile'])
+            writer.writeheader()
+
+    app = QApplication(sys.argv)
+    login_window = LoginWindow()
+    login_window.show()
+    sys.exit(app.exec_())
